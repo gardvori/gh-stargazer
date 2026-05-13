@@ -5,15 +5,17 @@ gh-stargazer — GitHub Stargazer Trend Analyzer
 Analyze star growth trends for any GitHub repository.
 No external dependencies — uses only Python stdlib.
 
+Uses the GitHub Events API for efficient recent star data.
+
 Usage:
-    gh-stargazer owner/repo [--days 30] [--compare owner/repo2] [--top N] [--json]
+    gh-stargazer owner/repo [--days 30] [--compare owner/repo2] [--json]
     gh-stargazer --help
 
 Examples:
     gh-stargazer torvalds/linux
     gh-stargazer golang/go --days 90
     gh-stargazer facebook/react --compare vuejs/vue
-    gh-stargazer microsoft/vscode --top 10
+    gh-stargazer microsoft/vscode --json
 """
 
 import argparse
@@ -30,28 +32,36 @@ TOKEN_ENV = "GITHUB_TOKEN"
 
 
 def get_token():
-    """Get GitHub token from environment."""
     import os
     return os.environ.get(TOKEN_ENV, "")
 
 
 def api_get(url, token=""):
-    """Make a GET request to GitHub API with optional auth."""
+    """Make a GET request to GitHub API."""
     req = urllib.request.Request(url)
-    req.add_header("Accept", "application/vnd.github.v3.star+json")
+    req.add_header("Accept", "application/vnd.github.v3+json")
     req.add_header("User-Agent", "gh-stargazer/1.0")
     if token:
         req.add_header("Authorization", f"token {token}")
     try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            link_header = resp.headers.get("Link", "")
+            data = json.loads(resp.read().decode())
+            return data, link_header
     except urllib.error.HTTPError as e:
         if e.code == 404:
             print(f"Error: Repository not found or not accessible.", file=sys.stderr)
             sys.exit(1)
         elif e.code == 403:
-            print(f"Error: API rate limit exceeded. Set {TOKEN_ENV} env var.", file=sys.stderr)
+            body = e.read().decode() if e.fp else ""
+            if "rate limit" in body.lower():
+                print(f"Error: API rate limit exceeded. Set {TOKEN_ENV} env var.", file=sys.stderr)
+            else:
+                print(f"Error: Forbidden (403). Check your token permissions.", file=sys.stderr)
             sys.exit(1)
+        elif e.code == 422:
+            # GitHub returns 422 for pages beyond available range — not an error for us
+            raise StopIteration
         else:
             print(f"Error: HTTP {e.code}: {e.reason}", file=sys.stderr)
             sys.exit(1)
@@ -60,40 +70,89 @@ def api_get(url, token=""):
         sys.exit(1)
 
 
-def fetch_stargazers(owner, repo, token="", max_pages=100):
-    """Fetch stargazers with timestamps using GitHub API."""
+def get_last_page_num(link_header):
+    """Extract the last page number from a Link header."""
+    if not link_header:
+        return 1
+    for part in link_header.split(","):
+        if 'rel="last"' in part:
+            url_part = part.split(";")[0].strip().strip("<>")
+            if "page=" in url_part:
+                try:
+                    return int(url_part.split("page=")[1].split("&")[0])
+                except (ValueError, IndexError):
+                    pass
+    return 1
+
+
+def fetch_star_events(owner, repo, token="", days=30, max_pages=15):
+    """
+    Fetch star events using the GitHub Events API.
+    This is much more efficient than the stargazers endpoint for recent data.
+    """
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
     stars = []
-    page = 1
-    while page <= max_pages:
-        url = f"{GITHUB_API}/repos/{owner}/{repo}/stargazers?per_page=100&page={page}"
-        data = api_get(url, token)
+
+    # First page to get total pages
+    url = f"{GITHUB_API}/repos/{owner}/{repo}/events?per_page=100&page=1"
+    data, link_header = api_get(url, token)
+
+    if not data:
+        return stars
+
+    last_page = get_last_page_num(link_header)
+    pages_to_fetch = min(last_page, max_pages)
+
+    # Process first page
+    for event in data:
+        if event.get("type") == "WatchEvent":
+            event_time = event.get("created_at", "")
+            if event_time:
+                dt = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+                if dt >= cutoff:
+                    actor = event.get("actor", {})
+                    stars.append({
+                        "user": actor.get("login", "unknown"),
+                        "starred_at": event_time,
+                    })
+
+    # Fetch more pages if needed
+    for page in range(2, pages_to_fetch + 1):
+        url = f"{GITHUB_API}/repos/{owner}/{repo}/events?per_page=100&page={page}"
+        try:
+            data, _ = api_get(url, token)
+        except StopIteration:
+            break
+        except SystemExit:
+            break
+
         if not data:
             break
-        for entry in data:
-            if "starred_at" in entry:
-                stars.append({
-                    "user": entry["user"]["login"],
-                    "starred_at": entry["starred_at"],
-                })
-        if len(data) < 100:
+
+        for event in data:
+            if event.get("type") == "WatchEvent":
+                event_time = event.get("created_at", "")
+                if event_time:
+                    dt = datetime.fromisoformat(event_time.replace("Z", "+00:00"))
+                    if dt >= cutoff:
+                        actor = event.get("actor", {})
+                        stars.append({
+                            "user": actor.get("login", "unknown"),
+                            "starred_at": event_time,
+                        })
+
+        # If the last event on this page is before cutoff, we can stop
+        if data and data[-1].get("created_at", "") < cutoff.strftime("%Y-%m-%dT%H:%M:%SZ"):
             break
-        page += 1
+
     return stars
 
 
 def fetch_repo_info(owner, repo, token=""):
     """Fetch repository metadata."""
     url = f"{GITHUB_API}/repos/{owner}/{repo}"
-    req = urllib.request.Request(url)
-    req.add_header("Accept", "application/vnd.github.v3+json")
-    req.add_header("User-Agent", "gh-stargazer/1.0")
-    if token:
-        req.add_header("Authorization", f"token {token}")
-    try:
-        with urllib.request.urlopen(req) as resp:
-            return json.loads(resp.read().decode())
-    except Exception:
-        return {}
+    data, _ = api_get(url, token)
+    return data if isinstance(data, dict) else {}
 
 
 def aggregate_by_period(stars, period="day"):
@@ -104,7 +163,6 @@ def aggregate_by_period(stars, period="day"):
         if period == "day":
             key = dt.strftime("%Y-%m-%d")
         elif period == "week":
-            # ISO week
             key = dt.strftime("%Y-W%W")
         elif period == "month":
             key = dt.strftime("%Y-%m")
@@ -120,6 +178,8 @@ def detect_spikes(daily_counts, threshold=2.0):
         return []
     values = list(daily_counts.values())
     avg = sum(values) / len(values)
+    if avg < 1:
+        return []
     spikes = []
     for date, count in daily_counts.items():
         if count > avg * threshold and count > 2:
@@ -152,34 +212,42 @@ def format_bar(value, max_value, width=30):
     return "█" * filled + "░" * (width - filled)
 
 
-def analyze_repo(owner, repo, days=30, token="", verbose=True):
+def analyze_repo(owner, repo, days=30, token="", verbose=True, max_pages=15):
     """Analyze a single repository's star trends."""
     if verbose:
         print(f"\n📊 Analyzing {owner}/{repo}...")
-        print(f"   Fetching stargazers (last {days} days)...")
+        print(f"   Fetching star events (last {days} days, max {max_pages} pages)...")
 
-    stars = fetch_stargazers(owner, repo, token)
+    stars = fetch_star_events(owner, repo, token, days, max_pages)
     repo_info = fetch_repo_info(owner, repo, token)
 
-    if not stars:
-        print("   No stargazer data available (repo may have no stars or API limit reached).")
-        return {}
-
-    # Filter by date range
-    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
-    recent_stars = [
-        s for s in stars
-        if datetime.fromisoformat(s["starred_at"].replace("Z", "+00:00")) >= cutoff
-    ]
-
-    total_stars = repo_info.get("stargazers_count", len(stars))
+    total_stars = repo_info.get("stargazers_count", 0)
     description = repo_info.get("description", "N/A")
     language = repo_info.get("language", "N/A")
     created_at = repo_info.get("created_at", "N/A")
+    forks = repo_info.get("forks_count", "N/A")
 
-    daily = aggregate_by_period(recent_stars, "day")
-    weekly = aggregate_by_period(recent_stars, "week")
-    monthly = aggregate_by_period(recent_stars, "month")
+    if not stars:
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"  ⭐ {owner}/{repo}")
+            print(f"{'='*60}")
+            if description != "N/A":
+                print(f"  📝 {description}")
+            print(f"  📦 Language: {language}")
+            print(f"  ⭐ Total Stars: {total_stars:,}")
+            print(f"  📈 Stars in last {days} days: 0")
+            print(f"  (No star activity in the analyzed window)")
+        return {
+            "owner": owner, "repo": repo,
+            "total_stars": total_stars,
+            "recent_stars": 0, "daily_avg": 0,
+            "daily": {}, "weekly": {}, "monthly": {}, "spikes": [],
+        }
+
+    daily = aggregate_by_period(stars, "day")
+    weekly = aggregate_by_period(stars, "week")
+    monthly = aggregate_by_period(stars, "month")
     spikes = detect_spikes(daily)
 
     if verbose:
@@ -188,28 +256,33 @@ def analyze_repo(owner, repo, days=30, token="", verbose=True):
         print(f"{'='*60}")
         if description != "N/A":
             print(f"  📝 {description}")
-        print(f"  📦 Language: {language}")
+        if isinstance(forks, int):
+            print(f"  📦 Language: {language}  |  🍴 Forks: {forks:,}")
+        else:
+            print(f"  📦 Language: {language}")
         print(f"  ⭐ Total Stars: {total_stars:,}")
         if created_at != "N/A":
             print(f"  📅 Created: {created_at[:10]}")
-        print(f"  📈 Stars in last {days} days: {len(recent_stars):,}")
+        print(f"  📈 Stars in last {days} days: {len(stars):,}")
 
         if daily:
-            max_day_count = max(daily.values()) if daily else 0
+            max_day_count = max(daily.values())
             print(f"\n  📅 Daily Star Activity (last {days} days):")
             print(f"  {'─'*50}")
-            for date, count in list(daily.items())[-14:]:  # Last 14 days
+            daily_items = list(daily.items())[-14:]
+            for date, count in daily_items:
                 bar = format_bar(count, max_day_count, 20)
                 print(f"  {date}  {bar}  {count}")
 
-            avg_daily = len(recent_stars) / max(len(daily), 1)
-            print(f"\n  📊 Average: {avg_daily:.1f} stars/day (active days)")
-            if len(daily) > 0:
+            num_active_days = len(daily)
+            avg_daily = len(stars) / max(num_active_days, 1)
+            print(f"\n  📊 Average: {avg_daily:.1f} stars/day ({num_active_days} active days)")
+            if daily:
                 best_day = max(daily, key=daily.get)
                 print(f"  🏆 Best day: {best_day} ({daily[best_day]} stars)")
 
         if spikes:
-            print(f"\n  🚀 Star Spikes (>{2.0}x average):")
+            print(f"\n  🚀 Star Spikes (>2.0x average):")
             for spike in spikes[:5]:
                 print(f"     {spike['date']}: {spike['count']} stars ({spike['multiplier']}x avg)")
 
@@ -225,8 +298,8 @@ def analyze_repo(owner, repo, days=30, token="", verbose=True):
         "owner": owner,
         "repo": repo,
         "total_stars": total_stars,
-        "recent_stars": len(recent_stars),
-        "daily_avg": round(len(recent_stars) / max(len(daily), 1), 1),
+        "recent_stars": len(stars),
+        "daily_avg": round(len(stars) / max(len(daily), 1), 1),
         "daily": daily,
         "weekly": weekly,
         "monthly": monthly,
@@ -265,52 +338,36 @@ Examples:
     parser.add_argument("repo", help="Repository in owner/repo format")
     parser.add_argument("--days", type=int, default=30, help="Number of days to analyze (default: 30)")
     parser.add_argument("--compare", action="append", help="Additional repo to compare (owner/repo)")
-    parser.add_argument("--json", action="store_true", help="Output as JSON")
-    parser.add_argument("--top", type=int, help="Show top N recent stargazers")
+    parser.add_argument("--json", action="store_true", dest="json_output", help="Output as JSON")
+    parser.add_argument("--max-pages", type=int, default=15, help="Max API pages to fetch (default: 15)")
 
     args = parser.parse_args()
 
     token = get_token()
 
-    # Parse main repo
     parts = args.repo.split("/")
     if len(parts) != 2:
         print("Error: Repository must be in 'owner/repo' format.", file=sys.stderr)
         sys.exit(1)
 
     owner, repo = parts
-    result = analyze_repo(owner, repo, args.days, token, verbose=not args.json)
+    result = analyze_repo(owner, repo, args.days, token, verbose=not args.json_output, max_pages=args.max_pages)
     results = [result]
 
-    # Compare repos
     if args.compare:
         for comp_repo in args.compare:
             parts = comp_repo.split("/")
             if len(parts) != 2:
                 print(f"Warning: Skipping invalid repo format: {comp_repo}", file=sys.stderr)
                 continue
-            comp_result = analyze_repo(parts[0], parts[1], args.days, token, verbose=not args.json)
+            comp_result = analyze_repo(parts[0], parts[1], args.days, token, verbose=not args.json_output, max_pages=args.max_pages)
             results.append(comp_result)
 
-        if not args.json and len(results) > 1:
+        if not args.json_output and len(results) > 1:
             compare_repos(results)
 
-    # Show top stargazers
-    if args.top and result:
-        print(f"\n  👤 Top {args.top} Recent Stargazers:")
-        stars = fetch_stargazers(owner, repo, token)
-        cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
-        recent = [
-            s for s in stars
-            if datetime.fromisoformat(s["starred_at"].replace("Z", "+00:00")) >= cutoff
-        ]
-        for i, star in enumerate(recent[:args.top]):
-            print(f"     {i+1}. @{star['user']} — {star['starred_at'][:10]}")
-
-    # JSON output
-    if args.json:
+    if args.json_output:
         output = results[0] if len(results) == 1 else results
-        # Remove non-serializable items
         print(json.dumps(output, indent=2, default=str))
 
 
